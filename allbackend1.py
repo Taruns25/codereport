@@ -24,19 +24,86 @@ from reportlab.lib import colors
 from reportlab.lib.units import inch
 from dotenv import load_dotenv
 import traceback
+import tempfile
+import shutil
+import subprocess
+import stat
 
 load_dotenv()
 
+# ====================== NEW: EXTENSION MAPPING ======================
+EXTENSION_MAP = {
+    '.js': 'javascript',
+    '.jsx': 'javascript',
+    '.ts': 'typescript',
+    '.tsx': 'typescript',
+    '.py': 'python',
+    '.java': 'java',
+    '.c': 'c',
+    '.h': 'c',
+    '.cpp': 'cpp',
+    '.cc': 'cpp',
+    '.cxx': 'cpp',
+    '.hpp': 'cpp',
+    '.go': 'go',
+    '.rs': 'rust',
+    '.php': 'php',
+    '.rb': 'ruby',
+    '.swift': 'swift',
+    '.kt': 'kotlin',
+    '.cs': 'csharp'
+}
+# ====================================================================
+
+def clone_github_repo(repo_url: str) -> str:
+    """Clones a GitHub repository and returns the path to the local copy"""
+    temp_dir = tempfile.mkdtemp(prefix="repo_")
+    try:
+        subprocess.run(['git', 'clone', repo_url, temp_dir], check=True)
+        print(f"Cloned repository to: {temp_dir}")
+        return temp_dir
+    except subprocess.CalledProcessError as e:
+        shutil.rmtree(temp_dir)
+        raise RuntimeError(f"Failed to clone GitHub repo: {e}")
+
+def handle_remove_readonly(func, path, exc_info):
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+def process_input_path(input_path: str, include_uml=True):
+    """Accepts either a local path or GitHub URL, processes code files"""
+    is_url = input_path.startswith("http://") or input_path.startswith("https://")
+    local_path = input_path
+    
+    if is_url:
+        if "github.com" in input_path:
+            local_path = clone_github_repo(input_path)
+        else:
+            raise ValueError("Only GitHub URLs are supported currently.")
+
+    process_directory(local_path, include_uml=include_uml)
+
+    if is_url:
+        shutil.rmtree(local_path, onerror=handle_remove_readonly)
+        print(f"Cleaned up temporary clone: {local_path}")
+    
 # Universal file reader with encoding fallback
 def read_file_with_fallback(filepath):
-    encodings = ['utf-8', 'utf-16', 'latin-1', 'cp1252']
+    encodings = ['utf-8-sig', 'utf-16', 'utf-8', 'latin-1', 'cp1252']
     for encoding in encodings:
         try:
             with open(filepath, 'r', encoding=encoding) as f:
-                return f.read()
-        except UnicodeDecodeError:
+                content = f.read()
+                # Skip obviously invalid Python files
+                if content.strip() == "" or len(content) < 10:
+                    raise ValueError("File is empty or too short.")
+                return content
+        except (UnicodeDecodeError, ValueError):
             continue
-    raise UnicodeDecodeError(f"Failed to decode {filepath} with tried encodings: {encodings}")
+        except Exception as e:
+            print(f"Error reading {filepath}: {e}")
+            return ""
+    return ""
 
 class FileState(TypedDict):
     file_path: str
@@ -70,8 +137,8 @@ LANGUAGE_CONFIG = {
         'tree_sitter_query': """
             (function_declaration name: (identifier) @name) @block_node
             (class_declaration name: (identifier) @name) @block_node
-            (lexical_declaration (variable_declarator name: (identifier) value: (arrow_function)) @name) @block_node
-            (variable_declarator name: (identifier) value: (function_expression)) @name @block_node
+            (lexical_declaration (variable_declarator name: (identifier) value: (arrow_function)) @block_node)
+            (variable_declarator name: (identifier) value: [(function) (arrow_function)]) @block_node
         """
     },
     'java': {
@@ -167,23 +234,37 @@ if 'Code' not in PDF_STYLES:
         borderPadding=5
     ))
 
+# ====================== UPDATED LANGUAGE DETECTION ======================
 def detect_language(file_path: str, content: str) -> str:
-    """Enhanced language detection with fallbacks"""
+    """Enhanced language detection with Pygments-compatible names"""
+    # Try by file extension first
+    ext = Path(file_path).suffix.lower()
+    if ext in EXTENSION_MAP:
+        return EXTENSION_MAP[ext]
+    
+    # Try Pygments filename detection
     try:
         lexer = get_lexer_for_filename(file_path)
-        return lexer.name.lower()
+        return lexer.aliases[0] if lexer.aliases else lexer.name.lower()
     except:
-        try:
-            lexer = guess_lexer(content)
-            return lexer.name.lower()
-        except:
-            ext = Path(file_path).suffix[1:]
-            return ext if ext else 'unknown'
+        pass
+    
+    # Try content-based guessing
+    try:
+        lexer = guess_lexer(content)
+        return lexer.aliases[0] if lexer.aliases else lexer.name.lower()
+    except:
+        pass
+    
+    # Final fallback
+    return 'text'
+# ========================================================================
 
 def analyze_full_code(state: FileState) -> FileState:
     try:
         state['content'] = read_file_with_fallback(state['file_path'])
         state['language'] = detect_language(state['file_path'], state['content'])
+        print(f"Detected language: {state['language']} for file: {state['file_path']}")
 
         prompt = ChatPromptTemplate.from_template("""
         Analyze the following {language} code and provide a technical summary:
@@ -208,6 +289,7 @@ def extract_code_blocks(state: FileState) -> FileState:
     content = state['content']
     language = state['language']
     file_name = Path(state['file_path']).name  # Fixed path handling
+    file_path = Path(state['file_path'])
 
     try:
         # Try Python AST first for Python files
@@ -215,10 +297,11 @@ def extract_code_blocks(state: FileState) -> FileState:
             try:
                 tree = ast.parse(content)
                 blocks = []
+
                 for node in ast.walk(tree):
                     if isinstance(node, (ast.ClassDef, ast.FunctionDef)):
                         block_code = ast.get_source_segment(content, node) or "\n".join(
-                            content.splitlines()[node.lineno-1:node.end_lineno]
+                            content.splitlines()[node.lineno - 1:node.end_lineno]
                         )
                         blocks.append({
                             'name': node.name,
@@ -227,12 +310,13 @@ def extract_code_blocks(state: FileState) -> FileState:
                             'end_line': node.end_lineno,
                             'code': block_code
                         })
+
                 if blocks:
                     state['code_blocks'] = blocks
                     return state
             except Exception as e:
-                print(f"AST failed for {file_name}, falling back to Tree-sitter: {str(e)}")
-
+                print(f"AST parsing failed for {file_path.name}: {e}")
+        
         # Try Tree-sitter parsing
         parser_info = PARSERS.get(language)
         if parser_info:
@@ -301,6 +385,7 @@ def extract_code_blocks(state: FileState) -> FileState:
         state['code_blocks'] = []
     
     return state
+
 def explain_code_with_llm(block, state: FileState) -> str:
     """Generate explanations for code blocks using LLM."""
     prompt = ChatPromptTemplate.from_template("""
@@ -319,42 +404,82 @@ def explain_code_with_llm(block, state: FileState) -> str:
         "code": block['code'],
         "language": state['language']
     })
+
+# ====================== UPDATED SCREENSHOT GENERATION ======================
 def generate_code_block_screenshot(state: FileState) -> FileState:
     for block in state['code_blocks']:
+        block_name = block.get('name', f"block_{state['code_blocks'].index(block)}")
         try:
-            # Try to get appropriate lexer for the language
+            # Get lexer with multiple fallbacks
             lexer = None
-            try:
-                lexer = get_lexer_by_name(state['language'])
-            except:
-                lexer = get_lexer_by_name("text")  # Fallback
+            language = state['language'].lower()
             
+            # Try direct match
+            try:
+                lexer = get_lexer_by_name(language)
+            except:
+                # Try common aliases
+                alias_map = {
+                    'js': 'javascript',
+                    'javascript': 'javascript',
+                    'ts': 'typescript',
+                    'typescript': 'typescript',
+                    'py': 'python',
+                    'python': 'python',
+                    'c': 'c',
+                    'cpp': 'cpp',
+                    'c++': 'cpp',
+                    'java': 'java',
+                    'go': 'go',
+                    'golang': 'go',
+                    'rs': 'rust',
+                    'rust': 'rust',
+                    'text': 'text'
+                }
+                lexer_name = alias_map.get(language, 'text')
+                lexer = get_lexer_by_name(lexer_name)
+            
+            # Create temp file in a cross-platform way
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+                temp_image_path = temp_file.name
+            
+            # Generate the image
             formatter = ImageFormatter(
                 style='monokai',
                 line_numbers=True,
                 font_size=12,
                 line_pad=0,
-                image_pad=10
+                image_pad=10,
+                image_format='png'
             )
-
-            image_data = highlight(block['code'], lexer, formatter)
-            temp_image_path = f"temp_{block['name']}.png"
             
-            with open(temp_image_path, 'wb') as f:
-                f.write(image_data)
-
+            highlight(block['code'], lexer, formatter, outfile=temp_image_path)
+            
+            # Resize if too wide
             with PILImage.open(temp_image_path) as img:
-                if img.size[0] > 1200:
-                    ratio = 1200 / img.size[0]
-                    new_height = int(img.size[1] * ratio)
+                if img.width > 1200:
+                    ratio = 1200 / img.width
+                    new_height = int(img.height * ratio)
                     img.resize((1200, new_height), PILImage.Resampling.LANCZOS).save(temp_image_path)
-
-            state['screenshots'][block['name']] = temp_image_path
-            state['summaries'][block['name']] = explain_code_with_llm(block, state)
-
+            
+            state['screenshots'][block_name] = temp_image_path
+            print(f"Generated screenshot for {block_name} at {temp_image_path}")
+            
+            # Generate summary if not already present
+            if block_name not in state['summaries']:
+                state['summaries'][block_name] = explain_code_with_llm(block, state)
+                
         except Exception as e:
-            print(f"Error generating screenshot for block {block['name']}: {str(e)}")
+            print(f"Error generating screenshot for {block_name}: {str(e)}")
+            traceback.print_exc()
+            
+            # Fallback: store code as text
+            state['screenshots'][block_name] = None
+            if block_name not in state['summaries']:
+                state['summaries'][block_name] = f"Code block:\n{block['code']}"
+    
     return state
+# ===========================================================================
 
 def split_image_for_pdf(image_path, max_height=500):
     with PILImage.open(image_path) as img:
@@ -431,6 +556,7 @@ def format_markdown_to_story(text: str, styles) -> list:
 
     return story
 
+# ====================== UPDATED PDF GENERATION ======================
 def generate_pdf_report(state: FileState) -> FileState:
     """Generate the final PDF report with code analysis and visuals."""
     try:
@@ -472,12 +598,14 @@ def generate_pdf_report(state: FileState) -> FileState:
         # Add code blocks with screenshots
         story.append(Paragraph("Detailed Code Analysis", styles['Heading1']))
         for block in state['code_blocks']:
-            story.append(Paragraph(f"{block['type'].title()}: {block['name']}", styles['Heading2']))
-
-            if block['name'] in state['screenshots']:
+            block_name = block.get('name', f"block_{state['code_blocks'].index(block)}")
+            story.append(Paragraph(f"{block['type'].title()}: {block_name}", styles['Heading2']))
+            
+            # Handle screenshot if available
+            screenshot_path = state['screenshots'].get(block_name)
+            if screenshot_path and os.path.exists(screenshot_path):
                 try:
-                    image_path = state['screenshots'][block['name']]
-                    sections = split_image_for_pdf(image_path, max_height=available_height)
+                    sections = split_image_for_pdf(screenshot_path, max_height=available_height)
 
                     for section in sections:
                         with PILImage.open(section) as img:
@@ -488,32 +616,43 @@ def generate_pdf_report(state: FileState) -> FileState:
                         story.append(PageBreak())
                 except Exception as e:
                     print(f"Error adding code screenshot: {str(e)}")
-
-            if block['name'] in state['summaries']:
-                story.extend(format_markdown_to_story(state['summaries'][block['name']], styles))
-                story.append(Spacer(1, 24))
-
+                    story.append(Paragraph("Could not generate screenshot", styles['Italic']))
+            else:
+                # Add code as text if screenshot missing
+                story.append(Paragraph("Code:", styles['Heading3']))
+                story.append(Preformatted(block['code'], styles['Code']))
+            
+            # Add summary
+            if block_name in state['summaries']:
+                story.extend(format_markdown_to_story(state['summaries'][block_name], styles))
+            
+            story.append(Spacer(1, 24))
             story.append(PageBreak())
-
+        
         doc.build(story)
+        print(f"PDF report generated at: {state['pdf_path']}")
 
-        # Cleanup temporary screenshot files
-        for block in state['code_blocks']:
-            if block['name'] in state['screenshots']:
-                base = Path(state['screenshots'][block['name']])
-                if base.exists():
-                    base.unlink()
-                for section_file in Path(".").glob(f"{base.stem}_section_*.png"):
-                    try:
-                        section_file.unlink()
-                    except Exception as e:
-                        print(f"Could not delete {section_file}: {e}")
+        # Enhanced cleanup
+        for block_name, screenshot_path in state['screenshots'].items():
+            if screenshot_path and os.path.exists(screenshot_path):
+                try:
+                    os.unlink(screenshot_path)
+                    # Also clean up split sections if any
+                    base_path = Path(screenshot_path).stem
+                    for section_file in Path(".").glob(f"{base_path}_section_*.png"):
+                        try:
+                            section_file.unlink()
+                        except:
+                            pass
+                except Exception as e:
+                    print(f"Could not delete {screenshot_path}: {e}")
 
     except Exception as e:
         print(f"PDF generation failed: {str(e)}")
         traceback.print_exc()
 
     return state
+# ====================================================================
 
 
 class FileAnalyzer:
@@ -529,15 +668,21 @@ class FileAnalyzer:
         self.api_routes = {}
         self.direct_references = set()
         self.indirect_references = set()
-
+    
     def analyze_folder(self, max_depth=3):
-        """Analyze all files in the directory up to specified depth"""
+        exclude_dirs = {'.git', '.github', '__pycache__', 'venv', '.venv', 'node_modules'}
+        code_extensions = {'.py', '.js', '.java', '.c', '.cpp', '.go', '.rs', '.ts'}
+        
         for root, _, files in os.walk(self.root_path):
-            if len(Path(root).relative_to(self.root_path).parts) > max_depth:
+            # Skip excluded directories
+            if any(ex_dir in Path(root).parts for ex_dir in exclude_dirs):
                 continue
+                
             for file in files:
                 file_path = Path(root) / file
-                self.analyze_file(file_path)
+                # Only process code files
+                if file_path.suffix in code_extensions:
+                    self.analyze_file(file_path)
 
     def analyze_file(self, file_path):
         """Analyze a single file's structure and dependencies"""
@@ -567,7 +712,7 @@ class FileAnalyzer:
                     if isinstance(node, ast.ClassDef):
                         # Extract methods within classes
                         classes[node.name] = [n.name for n in node.body if isinstance(n, ast.FunctionDef)]
-                    elif isinstance(node, ast.FunctionDef) and not isinstance(node.parent, ast.ClassDef):
+                    elif isinstance(node, ast.FunctionDef):
                         # Top-level functions
                         functions[node.name] = []
                 self.class_info[file_path] = classes
@@ -729,7 +874,7 @@ class FileAnalyzer:
  
         for source, target in self.direct_references:
             source_name = str(Path(source).relative_to(self.root_path))
-            target_path = target.replace('.', '/')
+            target_path = str(target).replace('.', '/')
             for file_path in self.files_content.keys():
                 if Path(file_path).stem in target_path:
                     target_name = str(Path(file_path).relative_to(self.root_path))
@@ -855,7 +1000,7 @@ def process_directory(directory_path: str, include_uml=True):
     reports_dir = Path("code_analysis_reports")
     reports_dir.mkdir(exist_ok=True)
 
-    exclude_dirs = {'venv', '__pycache__', '.venv', 'env', 'node_modules', 'target', 'build'}
+    exclude_dirs = {'venv', '__pycache__', '.venv', 'env', 'node_modules', 'target', 'build', '.git', '.github'}
     extensions = {
         '.py', '.js', '.java', '.c', '.cpp', '.h', '.hpp',
         '.go', '.rs', '.ts', '.php', '.rb', '.swift', '.kt', '.cs'
@@ -892,4 +1037,5 @@ def process_directory(directory_path: str, include_uml=True):
             traceback.print_exc()
 
 if __name__ == "__main__":
-    process_directory(r"C:\Users\tsrinivas\OneDrive - Hitachi Vantara\Desktop\demo")
+    input_path = "https://github.com/any_repo/" # works with both actual git repo or local path(use r for local path)
+    process_input_path(input_path)
